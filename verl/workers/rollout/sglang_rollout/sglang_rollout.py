@@ -34,6 +34,7 @@ from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from verl.utils.net_utils import is_valid_ipv6_address
+from verl.utils.profiler import log_gpu_memory_snapshot
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.sglang_rollout.http_server_engine import AsyncHttpServerAdapter
@@ -71,9 +72,9 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
     if is_cuda():
         assert_pkg_version(
-            "sgl-kernel",
-            "0.1.1",
-            "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
+            "sglang-kernel",
+            "0.4.2.post1",
+            "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
         )
 
     # Set mp start method
@@ -100,7 +101,8 @@ class ServerAdapter(BaseRollout):
         device_mesh: DeviceMesh,
         replica_rank: int = -1,
     ):
-        if config.get("quantization", None) == "fp8":
+        super().__init__(config, model_config, device_mesh)
+        if self.config.get("quantization", None) == "fp8":
             import sglang
             from packaging import version
 
@@ -114,8 +116,7 @@ class ServerAdapter(BaseRollout):
                 "weight_block_size": [128, 128],
             }
             fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
-            model_config.hf_config.quantization_config = fp8_block_quant_kwargs
-        super().__init__(config, model_config, device_mesh)
+            self.model_config.hf_config.quantization_config = fp8_block_quant_kwargs
         self._engine: AsyncHttpServerAdapter = None
 
         rank = int(os.environ["RANK"])
@@ -172,13 +173,45 @@ class ServerAdapter(BaseRollout):
         """
         await self._init_server_adapter()
         if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
+            log_gpu_memory_snapshot(
+                "sglang_rollout.resume.begin",
+                role="rollout",
+                tags=tags,
+                replica_rank=self.replica_rank,
+                node_rank=self.node_rank,
+                rollout_rank=self.rollout_rank,
+            )
             await self._engine.resume_memory_occupation(tags=tags)
+            log_gpu_memory_snapshot(
+                "sglang_rollout.resume.end",
+                role="rollout",
+                tags=tags,
+                replica_rank=self.replica_rank,
+                node_rank=self.node_rank,
+                rollout_rank=self.rollout_rank,
+            )
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
         await self._init_server_adapter()
         if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
+            log_gpu_memory_snapshot(
+                "sglang_rollout.release.begin",
+                role="rollout",
+                tags=["kv_cache", "weights"],
+                replica_rank=self.replica_rank,
+                node_rank=self.node_rank,
+                rollout_rank=self.rollout_rank,
+            )
             await self._engine.release_memory_occupation(tags=["kv_cache", "weights"])
+            log_gpu_memory_snapshot(
+                "sglang_rollout.release.end",
+                role="rollout",
+                tags=["kv_cache", "weights"],
+                replica_rank=self.replica_rank,
+                node_rank=self.node_rank,
+                rollout_rank=self.rollout_rank,
+            )
 
     async def update_weights(
         self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int = None, **kwargs
@@ -198,6 +231,17 @@ class ServerAdapter(BaseRollout):
         await self._init_server_adapter()
 
         update_weights_bucket_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
+        is_update_rank = self.device_mesh["infer_tp"].get_local_rank() == 0
+        if is_update_rank:
+            log_gpu_memory_snapshot(
+                "sglang_rollout.update_weights.begin",
+                role="rollout",
+                global_steps=global_steps,
+                bucket_mb=self.config.checkpoint_engine.update_weights_bucket_megabytes,
+                replica_rank=self.replica_rank,
+                node_rank=self.node_rank,
+                rollout_rank=self.rollout_rank,
+            )
         if self.config.get("quantization", None) == "fp8":
             from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper
 
@@ -218,7 +262,16 @@ class ServerAdapter(BaseRollout):
                 device_mesh=self.device_mesh,
             )
 
-        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+        if is_update_rank:
             await self._engine.flush_cache()
             if global_steps is not None:
                 await self.server_actor.set_global_steps.remote(global_steps)
+            log_gpu_memory_snapshot(
+                "sglang_rollout.update_weights.end",
+                role="rollout",
+                global_steps=global_steps,
+                bucket_mb=self.config.checkpoint_engine.update_weights_bucket_megabytes,
+                replica_rank=self.replica_rank,
+                node_rank=self.node_rank,
+                rollout_rank=self.rollout_rank,
+            )

@@ -35,6 +35,7 @@ from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+from verl.trainer.ppo.training_trace import dump_training_trace
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -441,14 +442,26 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         with marked_timer("step", self.timing_raw):
             batch = await self._fit_generate(None)
-            batch = self._fit_compute_reward(batch)
-            batch = self._fit_compute_log_prob(batch)
-            batch = self._fit_compute_ref_log_prob(batch)
-            batch = self._fit_compute_critic(batch)
-            batch = self._fit_compute_advantage(batch)
-            batch = self._fit_update_critic(batch)
-            batch = self._fit_update_actor(batch)
-            self._fit_update_local_step()
+            target_param_version = self.current_param_version
+            if self.local_trigger_step >= self.trigger_parameter_sync_step:
+                target_param_version += 1
+            with self._timeline_span(
+                "training",
+                global_step=self.global_steps,
+                epoch=self.epoch,
+                component="fully_async_step",
+                param_version_before=self.current_param_version,
+                target_param_version=target_param_version,
+                local_trigger_step=self.local_trigger_step,
+            ):
+                batch = self._fit_compute_reward(batch)
+                batch = self._fit_compute_log_prob(batch)
+                batch = self._fit_compute_ref_log_prob(batch)
+                batch = self._fit_compute_critic(batch)
+                batch = self._fit_compute_advantage(batch)
+                batch = self._fit_update_critic(batch)
+                batch = self._fit_update_actor(batch)
+                self._fit_update_local_step()
             await self._fit_update_weights()
             self._fit_dump_data(batch)
 
@@ -456,6 +469,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_save_checkpoint()
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
+        self._fit_dump_training_trace(batch)
         self._fit_torch_memory()
         self._fit_postprocess_step()
 
@@ -510,8 +524,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.local_trigger_step != 1:
             return
 
-        with marked_timer("timing_s/param_sync", self.timing_raw):
-            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+        with self._timeline_span(
+            "transfer",
+            global_step=self.current_param_version,
+            epoch=self.epoch,
+            component="fully_async_rollout",
+        ):
+            with marked_timer("timing_s/param_sync", self.timing_raw):
+                await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
         print(
             f"[FullyAsyncTrainer] _fit_update_weights, "
             f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "
@@ -596,6 +616,23 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 )
         self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
 
+    def _fit_dump_training_trace(self, batch: DataProto):
+        self.metrics.update(
+            {
+                "fully_async/count/current_param_version": self.current_param_version,
+                "fully_async/count/trainer_global_step": self.global_steps,
+                "fully_async/count/local_trigger_step": self.local_trigger_step,
+            }
+        )
+        dump_training_trace(
+            config=self.config,
+            batch=batch,
+            metrics=self.metrics,
+            global_step=self.current_param_version,
+            epoch=self.epoch,
+            reward_extra_infos_dict=self.reward_extra_infos_dict,
+        )
+
     def _fit_save_checkpoint(self, force=False):
         if self.current_param_version == self.last_ckpt_version:
             return
@@ -613,15 +650,24 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # 2. It's the last training step.
         # 3. The current step number is a multiple of the save frequency.
         # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-        if self.config.trainer.save_freq > 0 and (
-            force and self.current_param_version % self.config.trainer.save_freq == 0 or esi_close_to_expiration
-        ):
+        should_save = self.config.trainer.save_freq > 0 and (
+            force or self.current_param_version % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+        )
+        if should_save:
             if esi_close_to_expiration:
                 print("Force saving checkpoint: ESI instance expiration approaching.")
-            with marked_timer("save_checkpoint", timing_raw, color="green"):
-                # sleep replicas to avoid OOM during checkpoint saving
-                self._save_checkpoint()
-                self.last_ckpt_version = self.current_param_version
+            with self._timeline_span(
+                "checkpoint",
+                global_step=self.current_param_version,
+                epoch=self.epoch,
+                component="trainer",
+                force=force,
+                esi_close_to_expiration=esi_close_to_expiration,
+            ):
+                with marked_timer("save_checkpoint", timing_raw, color="green"):
+                    # sleep replicas to avoid OOM during checkpoint saving
+                    self._save_checkpoint()
+                    self.last_ckpt_version = self.current_param_version
 
     def _fit_postprocess_step(self):
         self.global_steps += 1

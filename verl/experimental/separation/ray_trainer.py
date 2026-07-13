@@ -292,7 +292,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
-        self.checkpoint_manager.update_weights(self.global_steps)
+        with self._timeline_span("transfer", global_step=self.global_steps, phase="initial_weight_sync"):
+            self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -608,8 +609,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         metrics = self.metrics
         timing_raw = self.timing_raw
         if self.use_critic:
-            with marked_timer("update_critic", timing_raw, color="pink"):
-                critic_output = self._update_critic(batch)
+            with self._timeline_span("training", global_step=self.global_steps, epoch=self.epoch, component="critic"):
+                with marked_timer("update_critic", timing_raw, color="pink"):
+                    critic_output = self._update_critic(batch)
             critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
             metrics.update(critic_output_metrics)
         return batch
@@ -620,8 +622,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         # implement critic warmup
         if self.config.trainer.critic_warmup <= self.global_steps:
             # update actor
-            with marked_timer("update_actor", timing_raw, color="red"):
-                actor_output = self._update_actor(batch)
+            with self._timeline_span("training", global_step=self.global_steps, epoch=self.epoch, component="actor"):
+                with marked_timer("update_actor", timing_raw, color="red"):
+                    actor_output = self._update_actor(batch)
 
             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
             metrics.update(actor_output_metrics)
@@ -631,8 +634,11 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         timing_raw = self.timing_raw
         if self.config.trainer.critic_warmup <= self.global_steps:
             # update weights from trainer to rollout
-            with marked_timer("update_weights", timing_raw, color="red"):
-                self.checkpoint_manager.update_weights(self.global_steps)
+            with self._timeline_span(
+                "transfer", global_step=self.global_steps, epoch=self.epoch, component="actor_rollout"
+            ):
+                with marked_timer("update_weights", timing_raw, color="red"):
+                    self.checkpoint_manager.update_weights(self.global_steps)
 
     def _fit_dump_data(self, batch: DataProto):
         timing_raw = self.timing_raw

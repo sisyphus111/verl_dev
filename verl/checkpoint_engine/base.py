@@ -22,6 +22,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.utils.distributed import initialize_global_process_group_ray
+from verl.utils.profiler import log_gpu_memory_snapshot
 from verl.utils.ray_utils import auto_await
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
@@ -284,8 +285,20 @@ class CheckpointEngineWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
+        log_gpu_memory_snapshot(
+            "rollout_checkpoint_worker.update_weights.begin",
+            role="rollout",
+            global_steps=global_steps,
+            replica_rank=getattr(self.server_adapter, "replica_rank", "n/a"),
+        )
         weights = self.checkpoint_engine.receive_weights()
         await self.server_adapter.update_weights(weights, global_steps=global_steps)
+        log_gpu_memory_snapshot(
+            "rollout_checkpoint_worker.update_weights.end",
+            role="rollout",
+            global_steps=global_steps,
+            replica_rank=getattr(self.server_adapter, "replica_rank", "n/a"),
+        )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

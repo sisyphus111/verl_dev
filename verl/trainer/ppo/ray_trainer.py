@@ -50,6 +50,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.training_trace import dump_training_trace
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
@@ -61,6 +62,7 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
+from verl.utils.timeline import timeline_span
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
@@ -308,6 +310,9 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+
+    def _timeline_span(self, stage: str, **metadata):
+        return timeline_span(self.config, stage, **metadata)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1015,6 +1020,43 @@ class RayPPOTrainer:
             dp_rank_mapping = worker_group._dispatch_info[role]
         return max(dp_rank_mapping) + 1
 
+    def _pad_batch_to_dp_size(self, batch: DataProto, worker_group, role: str) -> tuple[DataProto, int, int]:
+        dp_size = self._get_dp_size(worker_group, role)
+        batch_padded, pad_size = pad_dataproto_to_divisor(batch, dp_size)
+        return batch_padded, pad_size, dp_size
+
+    def _mask_padded_training_samples(self, batch: DataProto, pad_size: int):
+        if pad_size == 0:
+            return
+
+        for key in ("response_mask", "advantages", "returns", "rollout_is_weights"):
+            if key in batch.batch:
+                batch.batch[key][-pad_size:] = 0
+
+    def _spread_padded_training_samples(self, batch: DataProto, pad_size: int, dp_size: int):
+        if pad_size == 0:
+            return
+
+        total_size = len(batch)
+        local_size = total_size // dp_size
+        real_size = total_size - pad_size
+        indices = []
+        real_cursor = 0
+        pad_cursor = real_size
+
+        for rank in range(dp_size):
+            pads_for_rank = 1 if rank < pad_size else 0
+            real_take = local_size - pads_for_rank
+            indices.extend(range(real_cursor, real_cursor + real_take))
+            real_cursor += real_take
+            if pads_for_rank:
+                indices.append(pad_cursor)
+                pad_cursor += 1
+
+        assert real_cursor == real_size
+        assert pad_cursor == total_size
+        batch.reorder(torch.tensor(indices))
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens.
 
@@ -1086,6 +1128,7 @@ class RayPPOTrainer:
         metrics.update(global_balance_stats)
 
     def _compute_values(self, batch: DataProto) -> DataProto:
+        batch, pad_size, _ = self._pad_batch_to_dp_size(batch, self.critic_wg, "critic")
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to nopadding
@@ -1100,9 +1143,13 @@ class RayPPOTrainer:
             values = DataProto.from_tensordict(values)
         else:
             values = self.critic_wg.compute_values(batch)
+        values = unpad_dataproto(values, pad_size)
         return values
 
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        ref_wg = self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
+        ref_role = "actor" if self.ref_in_actor or self.use_legacy_worker_impl != "disable" else "ref"
+        batch, pad_size, _ = self._pad_batch_to_dp_size(batch, ref_wg, ref_role)
         if self.use_legacy_worker_impl == "disable":
             # step 1: convert dataproto to tensordict.
             batch_td = batch.to_tensordict()
@@ -1127,9 +1174,11 @@ class RayPPOTrainer:
         else:
             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
 
+        ref_log_prob = unpad_dataproto(ref_log_prob, pad_size)
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
+        batch, pad_size, _ = self._pad_batch_to_dp_size(batch, self.actor_rollout_wg, "actor")
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
@@ -1158,10 +1207,26 @@ class RayPPOTrainer:
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
+        old_log_prob = unpad_dataproto(old_log_prob, pad_size)
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
+        batch, pad_size, dp_size = self._pad_batch_to_dp_size(batch, self.actor_rollout_wg, "actor")
+        self._mask_padded_training_samples(batch, pad_size)
+        self._spread_padded_training_samples(batch, pad_size, dp_size)
+        if pad_size > 0:
+            global_mini_batch_size = (
+                self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+            )
+            batch.meta_info["ppo_mini_batch_size"] = (global_mini_batch_size + dp_size - 1) // dp_size
+            batch.meta_info["train_padding_size"] = pad_size
+            batch.meta_info["global_batch_info"] = {
+                "dp_size": dp_size,
+                "batch_num_tokens": int(batch.batch["response_mask"].sum().item()),
+                "global_batch_size": len(batch) - pad_size,
+                "loss_scale_factor": self.config.actor_rollout_ref.actor.get("loss_scale_factor", None),
+            }
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
@@ -1249,7 +1314,8 @@ class RayPPOTrainer:
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
-        self.checkpoint_manager.update_weights(self.global_steps)
+        with self._timeline_span("transfer", global_step=self.global_steps, phase="initial_weight_sync"):
+            self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -1365,7 +1431,11 @@ class RayPPOTrainer:
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        actor_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                        if len(batch) % actor_dp_size == 0:
+                            self._balance_batch(batch, metrics=metrics)
+                        else:
+                            metrics["global_seqlen/train_padding_size"] = actor_dp_size - len(batch) % actor_dp_size
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1495,16 +1565,22 @@ class RayPPOTrainer:
 
                     # update critic
                     if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self._update_critic(batch)
+                        with self._timeline_span(
+                            "training", global_step=self.global_steps, epoch=epoch, component="critic"
+                        ):
+                            with marked_timer("update_critic", timing_raw, color="pink"):
+                                critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self._update_actor(batch)
+                        with self._timeline_span(
+                            "training", global_step=self.global_steps, epoch=epoch, component="actor"
+                        ):
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                actor_output = self._update_actor(batch)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -1529,8 +1605,11 @@ class RayPPOTrainer:
                                 self._save_checkpoint()
 
                         # update weights from trainer to rollout
-                        with marked_timer("update_weights", timing_raw, color="red"):
-                            self.checkpoint_manager.update_weights(self.global_steps)
+                        with self._timeline_span(
+                            "transfer", global_step=self.global_steps, epoch=epoch, component="actor_rollout"
+                        ):
+                            with marked_timer("update_weights", timing_raw, color="red"):
+                                self.checkpoint_manager.update_weights(self.global_steps)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -1594,6 +1673,14 @@ class RayPPOTrainer:
                 gradient_norm = metrics.get("actor/grad_norm", None)
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+                dump_training_trace(
+                    config=self.config,
+                    batch=batch,
+                    metrics=metrics,
+                    global_step=self.global_steps,
+                    epoch=epoch,
+                    reward_extra_infos_dict=reward_extra_infos_dict,
+                )
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):

@@ -36,6 +36,7 @@ from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
+from verl.utils.timeline import timeline_span
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
@@ -354,6 +355,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        self.rollout_resource_pool = None
+        if self.config.actor_rollout_ref.rollout.get("enable_decoupled_spec", False):
+            self.resource_pool_manager.create_resource_pool()
+            self.rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
         self._init_async_objects()
         self._create_worker_classes()
         self._init_reward_loop()
@@ -393,7 +398,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         self.async_rollout_mode = True
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
-            config=self.config, worker_group=self.rollout_wg, reward_loop_worker_handles=reward_loop_worker_handles
+            config=self.config,
+            worker_group=self.rollout_wg,
+            rollout_resource_pool=getattr(self, "rollout_resource_pool", None),
+            reward_loop_worker_handles=reward_loop_worker_handles,
         )
 
     # Add samples to the pending_queue
@@ -499,12 +507,41 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
+        input_meta_info = dict(getattr(rollout_sample.full_batch, "meta_info", {}) or {})
+        try:
+            # self.global_steps may advance before this task runs; sample_id captures the enqueue step.
+            sample_global_steps = int(rollout_sample.sample_id.rsplit("_", 1)[-1])
+        except (AttributeError, ValueError):
+            sample_global_steps = self.global_steps
+        input_meta_info.setdefault("global_steps", sample_global_steps)
+        input_meta_info.setdefault("validate", False)
+
         # Calling asynchronous generation methods
-        ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        with timeline_span(
+            self.config,
+            "rollout",
+            global_step=sample_global_steps,
+            validate=False,
+            batch_size=len(rollout_sample.full_batch),
+            mode="fully_async_single",
+        ):
+            ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
         rollout_sample.full_batch = ret
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
+        rollout_sample.full_batch.non_tensor_batch["fully_async_sample_id"] = np.array(
+            [rollout_sample.sample_id] * len(rollout_sample.full_batch), dtype=object
+        )
+        if self.async_rollout_manager.rollout_trace_dir:
+            self.async_rollout_manager._dump_rollout_trace_outputs(
+                rollout_sample.full_batch,
+                {
+                    **input_meta_info,
+                    "epoch": rollout_sample.epoch,
+                    "sample_id": rollout_sample.sample_id,
+                },
+            )
         rollout_sample.rollout_status = await self.get_statistics()
 
         success = await self.message_queue_client.put_sample(

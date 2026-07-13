@@ -34,6 +34,7 @@ except ImportError:
 from contextlib import nullcontext
 
 from megatron.core import parallel_state as mpu
+from megatron.core.distributed import DistributedDataParallel as DDP
 
 from verl import DataProto
 from verl.models.mcore import get_mcore_weight_converter
@@ -69,6 +70,7 @@ from verl.utils.profiler import (
     DistProfilerExtension,
     GPUMemoryLogger,
     ProfilerConfig,
+    log_gpu_memory_snapshot,
     log_gpu_memory_usage,
     simple_timer,
 )
@@ -82,6 +84,77 @@ from verl.workers.rollout import get_rollout_class
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _storage_mib(tensor: torch.Tensor) -> float:
+    return tensor.untyped_storage().nbytes() / (1024**2)
+
+
+def _tensor_mib(tensor: torch.Tensor) -> float:
+    return tensor.numel() * tensor.element_size() / (1024**2)
+
+
+def _move_metrics_to_cpu(metrics):
+    def convert(value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.detach().item()
+            return value.detach().cpu()
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(convert(item) for item in value)
+        if isinstance(value, dict):
+            return {key: convert(item) for key, item in value.items()}
+        return value
+
+    return {key: convert(value) for key, value in metrics.items()}
+
+
+def _log_actor_param_shard(label: str, models):
+    dense_param_mib = 0.0
+    expert_param_mib = 0.0
+    grad_buffer_mib = 0.0
+    frozen_param_mib = 0.0
+    regular_param_mib = 0.0
+    dense_buffers = 0
+    expert_buffers = 0
+    ddp_chunks = 0
+    regular_chunks = 0
+
+    for model_chunk in models:
+        if isinstance(model_chunk, DDP):
+            ddp_chunks += 1
+            for buffer in model_chunk.buffers:
+                dense_buffers += 1
+                dense_param_mib += _storage_mib(buffer.param_data)
+                grad_buffer_mib += _storage_mib(buffer.grad_data)
+            for buffer in model_chunk.expert_parallel_buffers:
+                expert_buffers += 1
+                expert_param_mib += _storage_mib(buffer.param_data)
+                grad_buffer_mib += _storage_mib(buffer.grad_data)
+            for param in model_chunk.module.parameters():
+                if not param.requires_grad and param.device.type == get_device_name():
+                    frozen_param_mib += _tensor_mib(param)
+        else:
+            regular_chunks += 1
+            for param in model_chunk.parameters():
+                if param.device.type == get_device_name():
+                    regular_param_mib += _tensor_mib(param)
+
+    log_gpu_memory_snapshot(
+        label,
+        role="training",
+        actor_dense_param_shard_mib=f"{dense_param_mib:.2f}",
+        actor_expert_param_shard_mib=f"{expert_param_mib:.2f}",
+        actor_regular_param_mib=f"{regular_param_mib:.2f}",
+        actor_frozen_param_mib=f"{frozen_param_mib:.2f}",
+        actor_grad_buffer_mib=f"{grad_buffer_mib:.2f}",
+        actor_ddp_chunks=ddp_chunks,
+        actor_regular_chunks=regular_chunks,
+        actor_dense_buffers=dense_buffers,
+        actor_expert_buffers=expert_buffers,
+    )
 
 
 def set_random_seed(seed, only_rollout=False):
@@ -442,7 +515,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
             if self.rank == 0:
                 print_model_size(actor_module[0])
-            log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
+            log_gpu_memory_usage("After MegatronPPOActor init")
         elif self._is_ref:
             wrap_config = McoreModuleWrapperConfig(
                 is_value_model=False,  # ref is not value model
@@ -480,7 +553,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                         load_megatron_gptmodel_weights(
                             self.config, self.hf_config, ref_module, params_dtype=self.dtype, is_value_model=False
                         )
-            log_gpu_memory_usage("After ref module init", logger=logger)
+            log_gpu_memory_usage("After ref module init")
             return ref_module, self.hf_config
 
         # TODO: add more optimizer args into config
@@ -499,7 +572,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             actor_optimizer = None
             actor_optimizer_scheduler = None
 
-        log_gpu_memory_usage("After actor optimizer init", logger=logger)
+        log_gpu_memory_usage("After actor optimizer init")
 
         register_megatron_training_hooks(actor_module, actor_optimizer)
 
@@ -535,11 +608,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         )
 
         # 4. build rollout model
-        log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
+        log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout")
         self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
             config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
         )
-        log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
+        log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout")
 
         # Initialize base_sync_done for LoRA
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
@@ -577,7 +650,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         else:
             override_transformer_config = {}
         self.param_dtype = PrecisionType.to_dtype(self.config.actor.megatron.dtype)
-        log_gpu_memory_usage("Before init actor model and optimizer", logger=logger)
+        log_gpu_memory_usage("Before init actor model and optimizer")
         self.dtype = PrecisionType.to_dtype(self.param_dtype)
         if self._is_actor:
             # we need the model for actor and rollout
@@ -597,10 +670,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
             if self._is_offload_param:
                 offload_megatron_model_to_cpu(self.actor_module)
-                log_gpu_memory_usage("After offload actor params and grad during init", logger=logger)
+                log_gpu_memory_usage("After offload actor params and grad during init")
             if self._is_offload_optimizer:
                 offload_megatron_optimizer(self.actor_optimizer)
-                log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
+                log_gpu_memory_usage("After offload actor optimizer during init")
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
@@ -614,12 +687,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 mtp_config=self.config.model.mtp if self.config.model.mtp.enable else None,
             )
             print(f"routing replay layers: {len(RouterReplay.router_instances)}")
-            log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
+            log_gpu_memory_usage("After MegatronPPOActor init")
 
         if self._is_rollout:
             with use_original_torch_compile():
                 self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
-            log_gpu_memory_usage("After rollout init", logger=logger)
+            log_gpu_memory_usage("After rollout init")
 
         if self._is_ref:
             self.ref_module, self.ref_model_config = self._build_model_optimizer(
@@ -628,7 +701,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 override_model_config=override_model_config,
                 override_transformer_config=override_transformer_config,
             )
-            log_gpu_memory_usage("After ref model init", logger=logger)
+            log_gpu_memory_usage("After ref model init")
             self.ref_policy = MegatronPPOActor(
                 config=self.config.ref,
                 model_config=self.ref_model_config,
@@ -639,7 +712,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
             if self._ref_is_offload_param:
                 offload_megatron_model_to_cpu(self.ref_module)
-                log_gpu_memory_usage("After offload ref params during init", logger=logger)
+                log_gpu_memory_usage("After offload ref params during init")
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -675,16 +748,19 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
-        log_gpu_memory_usage("After init_model finish", logger=logger)
+        log_gpu_memory_usage("After init_model finish")
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
         aggressive_empty_cache(force_sync=True)
         set_expandable_segments(False)
 
+        _log_actor_param_shard("actor_param_shard.rollout_mode.begin", self.actor.actor_module)
         if self._is_offload_param:
+            _log_actor_param_shard("actor_param_shard.before_load_actor_params", self.actor.actor_module)
             load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
-            log_gpu_memory_usage("After load actor params during rollout_mode", logger=logger)
+            _log_actor_param_shard("actor_param_shard.after_load_actor_params", self.actor.actor_module)
+            log_gpu_memory_usage("After load actor params during rollout_mode")
 
         # Build peft_config for vLLM LoRA support
         peft_config = None
@@ -700,6 +776,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.rollout.sleep_level != 1 and self.config.rollout.free_cache_engine
             )
 
+        _log_actor_param_shard("actor_param_shard.before_export_weights", self.actor.actor_module)
         if self.bridge is not None:
             if self.vanilla_bridge:
                 per_tensor_param = self.bridge.export_weights(self.actor.actor_module)
@@ -716,43 +793,61 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.tf_config,
                 self.layer_name_mapping,
             )
+        _log_actor_param_shard("actor_param_shard.after_export_weights_iterator_created", self.actor.actor_module)
 
         if self.config.rollout.free_cache_engine:
+            _log_actor_param_shard("actor_param_shard.before_resume_rollout_weights", self.actor.actor_module)
             await self.rollout.resume(tags=["weights"])
+            _log_actor_param_shard("actor_param_shard.after_resume_rollout_weights", self.actor.actor_module)
         if do_lora_base_sync:
             # Base layer sync
             per_tensor_param_lora_base = self.bridge.export_hf_weights(
                 self.actor.actor_module, merge_adapter_weights=False
             )
-            await self.rollout.update_weights(
-                add_base_layer_suffix(per_tensor_param_lora_base, model_type=self.hf_config.model_type),
-                peft_config=peft_config,
-                base_sync_done=False,
-            )
+            _log_actor_param_shard("actor_param_shard.before_lora_base_update_weights", self.actor.actor_module)
+            try:
+                await self.rollout.update_weights(
+                    add_base_layer_suffix(per_tensor_param_lora_base, model_type=self.hf_config.model_type),
+                    peft_config=peft_config,
+                    base_sync_done=False,
+                )
+            except Exception:
+                _log_actor_param_shard("actor_param_shard.lora_base_update_weights.exception", self.actor.actor_module)
+                raise
+            _log_actor_param_shard("actor_param_shard.after_lora_base_update_weights", self.actor.actor_module)
 
             # Mark base sync as done after first successful sync
             self.base_sync_done = True
 
-        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
+        _log_actor_param_shard("actor_param_shard.before_rollout_update_weights", self.actor.actor_module)
+        try:
+            await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
+        except Exception:
+            _log_actor_param_shard("actor_param_shard.rollout_update_weights.exception", self.actor.actor_module)
+            raise
+        _log_actor_param_shard("actor_param_shard.after_rollout_update_weights", self.actor.actor_module)
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
+            _log_actor_param_shard("actor_param_shard.after_offload_actor_params", self.actor.actor_module)
         aggressive_empty_cache(force_sync=True)
+        _log_actor_param_shard("actor_param_shard.after_rollout_mode_empty_cache", self.actor.actor_module)
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
+            _log_actor_param_shard("actor_param_shard.after_resume_rollout_kv_cache", self.actor.actor_module)
 
         set_expandable_segments(True)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @GPUMemoryLogger(role="update_actor", logger=logger)
+    @GPUMemoryLogger(role="update_actor")
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
-            log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
+            log_gpu_memory_usage("After load actor params and grad during update_actor")
         if self._is_offload_optimizer:
             load_megatron_optimizer(self.actor_optimizer)
-            log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+            log_gpu_memory_usage("After load actor optimizer during update_actor")
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
@@ -773,6 +868,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         metrics["actor/lr"] = get_megatron_last_lr(self.actor_optimizer)
         self.actor_optimizer_scheduler.step(1)
+        metrics = _move_metrics_to_cpu(metrics)
 
         # TODO: here, we should return all metrics
         output = DataProto(meta_info={"metrics": metrics})
@@ -780,16 +876,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
-            log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
+            log_gpu_memory_usage("After offload actor params and grad during update_actor")
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+            log_gpu_memory_usage("After offload actor optimizer during update_actor")
 
         aggressive_empty_cache(force_sync=True)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
-    @GPUMemoryLogger(role="generate_sequences", logger=logger)
+    @GPUMemoryLogger(role="generate_sequences")
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
         assert self._is_rollout
@@ -810,14 +906,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_actor:  # For rollout only, we do not switch context.
             loop = get_event_loop()
             loop.run_until_complete(self.rollout_mode())
-            log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+            log_gpu_memory_usage("After switch to rollout mode")
 
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
-            log_gpu_memory_usage("After switch to trainer mode", logger=logger)
+            log_gpu_memory_usage("After switch to trainer mode")
 
         # We calculate the average timing across all ranks
         # to make sure meta_info["timing"] is the same
@@ -839,7 +935,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
+    @GPUMemoryLogger(role="compute_ref_log_prob")
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
         if self.peft_cls is not None:
@@ -849,7 +945,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         assert self._is_ref
         if self._ref_is_offload_param:
             load_megatron_model_to_gpu(self.ref_module, load_grad=False)
-            log_gpu_memory_usage("After load ref params and grad during compute_ref_log_prob", logger=logger)
+            log_gpu_memory_usage("After load ref params and grad during compute_ref_log_prob")
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
@@ -860,18 +956,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = output.to("cpu")
         if self._ref_is_offload_param:
             offload_megatron_model_to_cpu(self.ref_module)
-            log_gpu_memory_usage("After offload ref params and grad during compute_ref_log_prob", logger=logger)
+            log_gpu_memory_usage("After offload ref params and grad during compute_ref_log_prob")
         aggressive_empty_cache(force_sync=True)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @GPUMemoryLogger(role="compute_log_prob", logger=logger)
+    @GPUMemoryLogger(role="compute_log_prob")
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)
-            log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=logger)
+            log_gpu_memory_usage("After load actor params and grad during compute_log_prob")
         is_lora = data.meta_info.pop("is_lora", False)
         adapter_ctx = self.peft_cls.disable_adapter(self.actor_module) if is_lora else nullcontext()
         # we should always recompute old_log_probs when it is HybridEngine
@@ -907,7 +1003,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # clear kv cache
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
-            log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=logger)
+            log_gpu_memory_usage("After offload actor params and grad during compute_log_prob")
         aggressive_empty_cache(force_sync=True)
         return output
 
@@ -919,7 +1015,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 offload_megatron_model_to_cpu(self.actor_module)
             if self._is_offload_optimizer:
                 offload_megatron_optimizer(self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor params and optimizer during load_checkpoint", logger=logger)
+            log_gpu_memory_usage("After offload actor params and optimizer during load_checkpoint")
             return
 
         if self._is_offload_param:
@@ -953,9 +1049,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def async_calls_finalize_fn_exec(self, blocking=False):
-        from megatron.core.dist_checkpointing.strategies.base import async_calls
+        from verl.utils.megatron.async_checkpointing import maybe_finalize_async_calls
 
-        async_calls.maybe_finalize_async_calls(blocking=blocking)
+        maybe_finalize_async_calls(blocking=blocking)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def start_profile(self, **kwargs) -> None:
@@ -986,7 +1082,19 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
+        log_gpu_memory_snapshot(
+            "training.update_weights.begin",
+            role="training",
+            backend=self.config.rollout.checkpoint_engine.backend,
+            global_steps=global_steps,
+        )
         await self.rollout_mode()
+        log_gpu_memory_snapshot(
+            "training.update_weights.end",
+            role="training",
+            backend=self.config.rollout.checkpoint_engine.backend,
+            global_steps=global_steps,
+        )
         return True
 
 
@@ -1253,6 +1361,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
 
         metrics["critic/lr"] = get_megatron_last_lr(self.critic_optimizer)
         self.critic_optimizer_scheduler.step(1)
+        metrics = _move_metrics_to_cpu(metrics)
 
         output = DataProto(batch=None, meta_info={"metrics": metrics})
 

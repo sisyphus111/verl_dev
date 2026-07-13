@@ -13,6 +13,8 @@
 # limitations under the License.
 """Utils for tokenization."""
 
+import json
+import os
 import types
 import warnings
 
@@ -71,6 +73,31 @@ def set_pad_token_id(tokenizer):
         warnings.warn(f"tokenizer.pad_token is None. Now set to {tokenizer.eos_token}", stacklevel=1)
 
 
+def _use_fast_tokenizer_backend(name_or_path):
+    if not isinstance(name_or_path, str):
+        return False
+    return "deepseek-r1-distill-llama" in name_or_path.lower()
+
+
+def _sync_model_max_length_from_config(tokenizer, name_or_path):
+    if not isinstance(name_or_path, str):
+        return
+
+    config_path = os.path.join(name_or_path, "config.json")
+    if not os.path.isfile(config_path):
+        return
+
+    try:
+        with open(config_path) as f:
+            model_config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    max_position_embeddings = model_config.get("max_position_embeddings")
+    if isinstance(max_position_embeddings, int) and tokenizer.model_max_length < max_position_embeddings:
+        tokenizer.model_max_length = max_position_embeddings
+
+
 def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kwargs):
     """Create a huggingface pretrained tokenizer which correctness handles eos and pad tokens.
 
@@ -85,7 +112,7 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
         transformers.PreTrainedTokenizer: The pretrained tokenizer.
 
     """
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
     if correct_gemma2 and isinstance(name_or_path, str) and "gemma-2-2b-it" in name_or_path:
         # the EOS token in gemma2 is ambiguious, which may worsen RL performance.
@@ -95,7 +122,13 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
         )
         kwargs["eos_token"] = "<end_of_turn>"
         kwargs["eos_token_id"] = 107
-    tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    if _use_fast_tokenizer_backend(name_or_path):
+        # Transformers v5 can route DeepSeek-R1-Distill-Llama through a Llama
+        # tokenizer path that exposes byte-level artifacts in decoded text.
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(name_or_path, **kwargs)
+        _sync_model_max_length_from_config(tokenizer, name_or_path)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
     if correct_pad_token:
         set_pad_token_id(tokenizer)
     return tokenizer

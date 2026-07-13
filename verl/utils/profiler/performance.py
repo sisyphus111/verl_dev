@@ -15,6 +15,7 @@
 import datetime
 import inspect
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Optional
 
@@ -80,6 +81,37 @@ def log_gpu_memory_usage(head: str, logger: logging.Logger = None, level=logging
             print(message)
         else:
             logger.log(msg=message, level=level)
+
+
+def log_gpu_memory_snapshot(label: str, role: str, rank: int = None, **fields):
+    """Print a compact GPU memory snapshot for cross-process phase debugging."""
+    if dist.is_initialized() and rank is not None and dist.get_rank() != rank:
+        return
+
+    try:
+        mem_allocated, mem_reserved, mem_used, mem_total = _get_current_mem_info()
+        mem_error = None
+    except Exception as e:
+        mem_allocated = mem_reserved = mem_used = mem_total = "n/a"
+        mem_error = repr(e)
+    parts = [
+        "[VERL Memory]",
+        f"label={label}",
+        f"role={role}",
+        f"pid={os.getpid()}",
+        f"rank={dist.get_rank() if dist.is_initialized() else os.environ.get('RANK', 'n/a')}",
+        f"local_rank={os.environ.get('LOCAL_RANK', 'n/a')}",
+        f"cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', 'n/a')}",
+        f"torch_allocated={mem_allocated} GB",
+        f"torch_reserved={mem_reserved} GB",
+        f"driver_used={mem_used} GB",
+        f"driver_total={mem_total} GB",
+    ]
+    if mem_error is not None:
+        parts.append(f"mem_error={mem_error}")
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    # print(" ".join(parts), flush=True)
 
 
 class GPUMemoryLogger(DecoratorLoggerBase):

@@ -83,6 +83,7 @@ class TraceConfig(BaseConfig):
     project_name: Optional[str] = None
     experiment_name: Optional[str] = None
     backend: Optional[str] = None
+    trace_dir: Optional[str] = None
     token2text: bool = False
     max_samples_per_step_per_worker: Optional[int] = None
 
@@ -240,6 +241,8 @@ class RolloutConfig(BaseConfig):
     enable_rollout_routing_replay: bool = False
 
     enable_sleep_mode: bool = True
+
+    enable_decoupled_spec: bool = False
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
 

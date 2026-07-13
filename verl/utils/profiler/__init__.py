@@ -15,7 +15,7 @@
 from ..device import is_npu_available
 from ..import_utils import is_nvtx_available
 from .config import build_sglang_profiler_args, build_vllm_profiler_args
-from .performance import GPUMemoryLogger, log_gpu_memory_usage, simple_timer
+from .performance import GPUMemoryLogger, log_gpu_memory_snapshot, log_gpu_memory_usage, simple_timer
 from .profile import DistProfiler, DistProfilerExtension, ProfilerConfig
 
 # Select marker implementations by availability, but keep DistProfiler as our dispatcher
@@ -29,6 +29,7 @@ else:
 
 __all__ = [
     "GPUMemoryLogger",
+    "log_gpu_memory_snapshot",
     "log_gpu_memory_usage",
     "mark_start_range",
     "mark_end_range",

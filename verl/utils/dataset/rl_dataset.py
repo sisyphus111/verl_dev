@@ -153,7 +153,7 @@ class RLHFDataset(Dataset):
 
     def _read_files_and_tokenize(self):
         dataframes = []
-        for parquet_file in self.data_files:
+        for file_index, parquet_file in enumerate(self.data_files):
             # read files and cache
             if parquet_file.endswith(".parquet"):
                 dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
@@ -161,6 +161,13 @@ class RLHFDataset(Dataset):
                 dataframe = datasets.load_dataset("json", data_files=parquet_file)["train"]
             else:
                 raise ValueError(f"Unsupported file format: {parquet_file}")
+            for column_name in ("original_dataset_row_index", "original_dataset_file_index"):
+                if column_name in dataframe.column_names:
+                    dataframe = dataframe.remove_columns(column_name)
+            dataframe = dataframe.add_column("original_dataset_row_index", np.arange(len(dataframe), dtype=np.int64))
+            dataframe = dataframe.add_column(
+                "original_dataset_file_index", np.full(len(dataframe), file_index, dtype=np.int64)
+            )
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
@@ -357,7 +364,8 @@ class RLHFDataset(Dataset):
         # add index for each prompt
         if "extra_info" not in row_dict or row_dict["extra_info"] is None:
             row_dict["extra_info"] = dict()
-        index = row_dict.get("extra_info", {}).get("index", 0)
+        original_dataset_row_index = row_dict.get("original_dataset_row_index", item)
+        index = row_dict.get("extra_info", {}).get("index", original_dataset_row_index)
         tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
         interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})
         need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", self.need_tools_kwargs)

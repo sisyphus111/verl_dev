@@ -319,13 +319,18 @@ class MegatronEngine(BaseEngine):
 
         if self.model_config.mtp.enable:
             patch_engine_mtp(self.module, self.model_config)
+        else:
+            from verl.models.mcore.mtp_patch import patch_postprocess
+
+            for model in self.module:
+                patch_postprocess(model)
 
         # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
         if self.engine_config.forward_only:
             self.optimizer = None
             self.lr_scheduler = None
             self.to(device="cpu", model=self._is_offload_param, optimizer=False, grad=False)
-            log_gpu_memory_usage("After offload model during init (forward_only)", logger=logger)
+            log_gpu_memory_usage("After offload model during init (forward_only)")
             return
 
         self.optimizer = self._build_optimizer()
@@ -375,7 +380,7 @@ class MegatronEngine(BaseEngine):
             grad=self._is_offload_param,
         )
 
-        log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
+        log_gpu_memory_usage("After offload model/optimizer/grad during init")
 
     def train_mode(self, **kwargs):
         """

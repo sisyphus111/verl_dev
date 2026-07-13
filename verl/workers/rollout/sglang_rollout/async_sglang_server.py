@@ -17,6 +17,7 @@ import dataclasses
 import json
 import logging
 import os
+import socket
 from typing import Any, Optional
 
 import ray
@@ -25,10 +26,10 @@ import sglang.srt.entrypoints.engine
 import torch
 from packaging import version
 from ray.actor import ActorHandle
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.entrypoints.http_server import (
     ServerArgs,
     _GlobalState,
-    _launch_subprocesses,
     app,
     set_global_state,
 )
@@ -54,6 +55,113 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
+
+SGLANG_DP_ATTENTION_AVAILABLE_PORT_COUNT = 6
+SGLANG_DP_ATTENTION_ENV_PORT_MAX_COUNT = 30
+
+
+def _reserve_port_on_address(address: str, port: int) -> socket.socket:
+    family = socket.AF_INET6 if is_valid_ipv6_address(address) else socket.AF_INET
+    sock = socket.socket(family=family, type=socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if family == socket.AF_INET6 and hasattr(socket, "IPV6_V6ONLY"):
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        except OSError:
+            pass
+    try:
+        if family == socket.AF_INET6:
+            sock.bind((address, port, 0, 0))
+        else:
+            sock.bind((address, port))
+        sock.listen(1)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+def _get_numbered_env_ports(prefix: str = "PORT", max_count: int = 30) -> list[int]:
+    ports = []
+    for port_index in range(1, max_count + 1):
+        name = f"{prefix}{port_index}"
+        raw_port = os.environ.get(name)
+        if not raw_port:
+            continue
+        try:
+            port = int(raw_port)
+        except ValueError as exc:
+            raise ValueError(
+                f"{name} must be an integer TCP port, got {raw_port!r}"
+            ) from exc
+        if port <= 0 or port > 65535:
+            raise ValueError(f"{name} is out of TCP port range: {port}")
+        ports.append(port)
+
+    if len(set(ports)) != len(ports):
+        raise ValueError(
+            f"SGLang environment ports from {prefix}1..{prefix}{max_count} "
+            f"must be unique: {ports}"
+        )
+    return ports
+
+
+def _is_port_available_on_address(address: str, port: int) -> bool:
+    try:
+        sock = _reserve_port_on_address(address, port)
+    except OSError:
+        return False
+    sock.close()
+    return True
+
+
+def _select_sglang_dp_attention_available_ports(
+    address: str,
+    replica_rank: int,
+    avoid_ports: set[int],
+) -> list[int]:
+    """Select SGLang DP-attention available_ports from PORT1..PORT30."""
+    env_ports = _get_numbered_env_ports(
+        prefix="PORT",
+        max_count=SGLANG_DP_ATTENTION_ENV_PORT_MAX_COUNT,
+    )
+    if not env_ports:
+        raise RuntimeError(
+            "SGLang DP attention for multi-node rollout requires candidate "
+            f"ports from PORT1..PORT{SGLANG_DP_ATTENTION_ENV_PORT_MAX_COUNT}."
+        )
+
+    skipped_avoided_ports = [port for port in env_ports if port in avoid_ports]
+    candidate_ports = [port for port in env_ports if port not in avoid_ports]
+    available_ports = []
+    skipped_unavailable_ports = []
+    for port in candidate_ports:
+        if _is_port_available_on_address(address, port):
+            available_ports.append(port)
+        else:
+            skipped_unavailable_ports.append(port)
+
+    if skipped_avoided_ports or skipped_unavailable_ports:
+        logger.info(
+            "SGLang DP-attention env ports skipped on %s: reserved=%s unavailable=%s",
+            address,
+            skipped_avoided_ports,
+            skipped_unavailable_ports,
+        )
+
+    start = replica_rank * SGLANG_DP_ATTENTION_AVAILABLE_PORT_COUNT
+    selected_ports = available_ports[
+        start : start + SGLANG_DP_ATTENTION_AVAILABLE_PORT_COUNT
+    ]
+    if len(selected_ports) != SGLANG_DP_ATTENTION_AVAILABLE_PORT_COUNT:
+        raise RuntimeError(
+            "SGLang DP attention for multi-node rollout needs "
+            f"{SGLANG_DP_ATTENTION_AVAILABLE_PORT_COUNT} available PORT env "
+            f"ports for replica {replica_rank} on {address}; env_ports={env_ports} "
+            f"available_ports={available_ports} reserved={skipped_avoided_ports} "
+            f"unavailable={skipped_unavailable_ports}"
+        )
+    return selected_ports
 
 
 class SGLangHttpServer:
@@ -114,6 +222,7 @@ class SGLangHttpServer:
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
+        self.decoupled_spec_endpoint_infos: list[dict[str, Any]] = []
 
         # used for controlling sglang server profiler
         profiler_config = self.config.profiler
@@ -132,9 +241,45 @@ class SGLangHttpServer:
         self._master_address = None
         self._master_port = None
         self._master_sock = None
+        self._master_socks = []
+        self._dp_attention_available_ports = None
         if self.nnodes > 1 and self.node_rank == 0:
             self._master_address = self._server_address
-            self._master_port, self._master_sock = get_free_port(self._server_address, with_alive_sock=True)
+            engine_kwargs = dict(self.config.get("engine_kwargs", {}).get("sglang", {}) or {})
+            if engine_kwargs.get("enable_dp_attention", False):
+                if "available_ports" not in [
+                    f.name for f in dataclasses.fields(ServerArgs)
+                ]:
+                    raise RuntimeError(
+                        "SGLang enable_dp_attention with multi-node rollout "
+                        "requires ServerArgs.available_ports support."
+                    )
+                self._master_port, self._master_sock = get_free_port(
+                    self._server_address,
+                    with_alive_sock=True,
+                )
+                self._master_socks = [self._master_sock]
+                if engine_kwargs.get("available_ports") is None:
+                    self._dp_attention_available_ports = _select_sglang_dp_attention_available_ports(
+                        self._server_address,
+                        self.replica_rank,
+                        avoid_ports={self._master_port},
+                    )
+                else:
+                    self._dp_attention_available_ports = list(
+                        engine_kwargs["available_ports"]
+                    )
+                logger.info(
+                    "SGLangHttpServer, replica_rank: %s, DP-attention available_ports: %s",
+                    self.replica_rank,
+                    self._dp_attention_available_ports,
+                )
+            else:
+                self._master_port, self._master_sock = get_free_port(
+                    self._server_address,
+                    with_alive_sock=True,
+                )
+                self._master_socks = [self._master_sock]
             logger.info(
                 f"SGLangHttpServer, replica_rank: {self.replica_rank}, "
                 f"master address: {self._master_address}, port: {self._master_port}"
@@ -144,21 +289,35 @@ class SGLangHttpServer:
         """Get master address and port for init NCCL process group."""
         return self._master_address, self._master_port
 
+    def get_dp_attention_available_ports(self):
+        """Get DP-attention available_ports selected on the rank-0 node."""
+        return self._dp_attention_available_ports
+
     def get_server_address(self):
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
 
-    async def launch_server(self, master_address: str = None, master_port: int = None):
+    async def launch_server(
+        self,
+        master_address: str = None,
+        master_port: int = None,
+        dp_attention_available_ports: Optional[list[int]] = None,
+        decoupled_spec_config: Optional[dict[str, Any]] = None,
+    ):
         if self.nnodes > 1:
             if self.node_rank != 0:
                 assert master_address and master_port, "non-master node should provide master address and port"
                 self._master_address = master_address
                 self._master_port = master_port
+                self._dp_attention_available_ports = dp_attention_available_ports
             else:
-                self._master_sock.close()
+                for sock in self._master_socks:
+                    sock.close()
+                self._master_socks = []
+                self._master_sock = None
 
-        engine_kwargs = self.config.get("engine_kwargs", {}).get("sglang", {}) or {}
+        engine_kwargs = dict(self.config.get("engine_kwargs", {}).get("sglang", {}) or {})
         attention_backend = engine_kwargs.pop("attention_backend", None)
         quantization = self.config.get("quantization", None)
         if quantization is not None:
@@ -213,6 +372,16 @@ class SGLangHttpServer:
                 else f"{self._master_address}:{self._master_port}"
             )
             args["dist_init_addr"] = dist_init_addr
+            if (
+                engine_kwargs.get("enable_dp_attention", False)
+                and engine_kwargs.get("available_ports") is None
+            ):
+                if self._dp_attention_available_ports is None:
+                    raise RuntimeError(
+                        "SGLang DP attention requires available_ports selected "
+                        "from the rank-0 node."
+                    )
+                args["available_ports"] = list(self._dp_attention_available_ports)
 
         if self.config.prometheus.enable:
             if self.config.prometheus.served_model_name:
@@ -248,22 +417,57 @@ class SGLangHttpServer:
             args["enable_weights_cpu_backup"] = True
             args["enable_draft_weights_cpu_backup"] = True
 
+        if decoupled_spec_config is not None:
+            algorithm = decoupled_spec_config["algorithm"]
+            speculative_num_steps = int(decoupled_spec_config["speculative_num_steps"])
+            decoupled_spec_args = {
+                "speculative_algorithm": algorithm,
+                "speculative_num_steps": speculative_num_steps,
+                "speculative_num_draft_tokens": speculative_num_steps + 1,
+                "speculative_eagle_topk": 1,
+                "decoupled_spec_rank_base": int(decoupled_spec_config["rank_base"]),
+                "disable_overlap_schedule": True,
+                "disable_radix_cache": True,
+                "enable_mixed_chunk": False,
+            }
+            if algorithm == "DECOUPLED_DRAFT":
+                decoupled_spec_args.update(
+                    {
+                        "chunked_prefill_size": -1,
+                        "mamba_scheduler_strategy": "no_buffer",
+                    }
+                )
+            spec_trace_dir = decoupled_spec_config.get("spec_trace_dir", None)
+            if spec_trace_dir is not None:
+                decoupled_spec_args["spec_trace_dir"] = spec_trace_dir
+            args.update(decoupled_spec_args)
+
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
-        if version.parse(sglang.__version__) >= version.parse("0.5.7"):
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-                server_args=server_args,
-                init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-                run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
-                run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
-            )
-        else:
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-                server_args=server_args
-            )
+        (
+            self.tokenizer_manager,
+            self.template_manager,
+            _port_args,
+            scheduler_init_result,
+            subprocess_watchdog,
+        ) = Engine._launch_subprocesses(
+            server_args=server_args,
+            init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
+            run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
+            run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
+        )
+        self.scheduler_infos = scheduler_init_result.scheduler_infos
+        self.scheduler_info = self.scheduler_infos[0]
+        self.decoupled_spec_endpoint_infos = [
+            endpoint_info
+            for scheduler_info in self.scheduler_infos
+            for endpoint_info in scheduler_info.get("decoupled_spec_endpoint_infos", [])
+        ]
+        if self.tokenizer_manager is not None:
+            self.tokenizer_manager._subprocess_watchdog = subprocess_watchdog
 
         # In multi-node cases, non-zero rank nodes should not launch http server.
         if self.node_rank > 0:
@@ -292,6 +496,14 @@ class SGLangHttpServer:
 
         self._server_port, self._server_task = await run_uvicorn(app, server_args, self._server_address)
         self.tokenizer_manager.server_status = ServerStatus.Up
+
+    def get_decoupled_spec_endpoint_infos(self):
+        return list(self.decoupled_spec_endpoint_infos)
+
+    async def configure_decoupled_spec_peers(self, connect_endpoints: list[str]):
+        assert self.node_rank == 0, "decoupled-spec peers must be configured through the entry server"
+        assert self.tokenizer_manager is not None, "Tokenizer manager is not initialized"
+        return await self.tokenizer_manager.configure_decoupled_spec_peers(list(connect_endpoints))
 
     async def wake_up(self):
         if self.node_rank != 0:
@@ -385,10 +597,11 @@ class SGLangHttpServer:
         generate_request = GenerateReqInput(**request)
 
         output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
-        finish_reason = output["meta_info"]["finish_reason"]
+        meta_info = output["meta_info"]
+        finish_reason = meta_info["finish_reason"]
         finish_reason = finish_reason["type"] if finish_reason else None
         if return_logprob:
-            output_token_logprobs = output["meta_info"]["output_token_logprobs"]
+            output_token_logprobs = meta_info["output_token_logprobs"]
             log_probs, token_ids = zip(
                 *[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs], strict=True
             )
@@ -414,12 +627,27 @@ class SGLangHttpServer:
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
 
+        sglang_meta_info = {
+            key: value
+            for key, value in meta_info.items()
+            if key.startswith("spec_")
+            or key
+            in {
+                "prompt_tokens",
+                "completion_tokens",
+                "cached_tokens",
+                "reasoning_tokens",
+                "e2e_latency",
+            }
+        }
+        sglang_meta_info["finish_reason"] = finish_reason
+
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=finish_reason,
-            extra_fields={"global_steps": self.global_steps},
+            extra_fields={"global_steps": self.global_steps, "sglang_meta_info": sglang_meta_info},
         )
 
     async def set_global_steps(self, global_steps: int):
@@ -427,9 +655,13 @@ class SGLangHttpServer:
         self.global_steps = global_steps
 
     async def abort_all_requests(self):
+        if self.node_rank != 0:
+            return
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
 
     async def resume_generation(self):
+        if self.node_rank != 0:
+            return
         await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
 
     async def start_profile(self, **kwargs):
@@ -463,13 +695,20 @@ class SGLangReplica(RolloutReplica):
     ):
         super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
         self.server_class = ray.remote(SGLangHttpServer)
+        self.decoupled_spec_config: Optional[dict[str, Any]] = None
 
-    async def launch_servers(self):
-        """Launch http server in each node."""
+    def set_decoupled_spec_config(self, decoupled_spec_config: Optional[dict[str, Any]]):
+        self.decoupled_spec_config = decoupled_spec_config
+
+    async def prepare_server_actors(self, server_name_prefix: Optional[str] = None):
+        """Create SGLang server actors in each node without launching SGLang."""
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
+        if self.servers:
+            return None
 
+        server_name_prefix = server_name_prefix or ("sglang_server_reward" if self.is_reward_model else "sglang_server")
         # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
         worker_infos = await asyncio.gather(
             *[
@@ -481,6 +720,7 @@ class SGLangReplica(RolloutReplica):
         )
         worker_cuda_visible_devices = [worker_info[1] for worker_info in worker_infos]
         worker_node_ids = [worker_info[0] for worker_info in worker_infos]
+        entry_runtime_info = {"node_id": worker_node_ids[0]}
         base_gpu_id = 0
         infer_tp = self.config.tensor_model_parallel_size * self.config.data_parallel_size
         replica_world_size = infer_tp * self.config.pipeline_model_parallel_size
@@ -510,11 +750,7 @@ class SGLangReplica(RolloutReplica):
             )
 
             node_id = worker_node_ids[node_rank * self.gpus_per_replica_node]
-            name = (
-                f"sglang_server_{self.replica_rank}_{node_rank}"
-                if not self.is_reward_model
-                else f"sglang_server_reward_{self.replica_rank}_{node_rank}"
-            )
+            name = f"{server_name_prefix}_{self.replica_rank}_{node_rank}"
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
@@ -536,14 +772,29 @@ class SGLangReplica(RolloutReplica):
                 base_gpu_id=base_gpu_id,
             )
             self.servers.append(server)
+        return entry_runtime_info
+
+    async def launch_prepared_servers(self, decoupled_spec_config: Optional[dict[str, Any]] = None):
+        """Launch already-created server actors."""
+        await self.prepare_server_actors()
+        decoupled_spec_config = decoupled_spec_config or self.decoupled_spec_config
 
         # launch http server in each node
         master_address, master_port = None, None
+        dp_attention_available_ports = None
         if self.nnodes > 1:
             master_address, master_port = await self.servers[0].get_master_address.remote()
+            dp_attention_available_ports = (
+                await self.servers[0].get_dp_attention_available_ports.remote()
+            )
         await asyncio.gather(
             *[
-                server.launch_server.remote(master_address=master_address, master_port=master_port)
+                server.launch_server.remote(
+                    master_address=master_address,
+                    master_port=master_port,
+                    dp_attention_available_ports=dp_attention_available_ports,
+                    decoupled_spec_config=decoupled_spec_config,
+                )
                 for server in self.servers
             ]
         )
@@ -556,3 +807,21 @@ class SGLangReplica(RolloutReplica):
             if is_valid_ipv6_address(server_address)
             else f"{server_address}:{server_port}"
         )
+
+    async def get_decoupled_spec_endpoint_infos(self):
+        """Collect published decoupled-spec bind endpoints from all server actors."""
+        await self.prepare_server_actors()
+        endpoint_infos_by_server = await asyncio.gather(
+            *[server.get_decoupled_spec_endpoint_infos.remote() for server in self.servers]
+        )
+        return [info for endpoint_infos in endpoint_infos_by_server for info in endpoint_infos]
+
+    async def configure_decoupled_spec_peers(self, connect_endpoints: list[str]):
+        """Configure decoupled-spec peer endpoints through the entry server."""
+        await self.prepare_server_actors()
+        return await self.servers[0].configure_decoupled_spec_peers.remote(list(connect_endpoints))
+
+    async def launch_servers(self):
+        """Launch http server in each node."""
+        await self.prepare_server_actors()
+        await self.launch_prepared_servers()

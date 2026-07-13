@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import csv
+import json
 import logging
 import os
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -44,6 +47,7 @@ from verl.utils.rollout_trace import (
     rollout_trace_attr,
     rollout_trace_op,
 )
+from verl.utils.timeline import timeline_span
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
@@ -94,6 +98,33 @@ def _get_rollout_and_model_config(config: DictConfig) -> tuple[DictConfig, DictC
         return config.actor_rollout_ref.rollout, config.actor_rollout_ref.model
     else:
         return config.rollout, config.model
+
+
+def _config_get(config: Any, key: str) -> Any:
+    if config is None:
+        return None
+    if hasattr(config, "get"):
+        return config.get(key, None)
+    return getattr(config, key, None)
+
+
+def _is_decoupled_spec_enabled(rollout_config: Any) -> bool:
+    return bool(_config_get(rollout_config, "enable_decoupled_spec"))
+
+
+def _get_rollout_trace_dir(config: DictConfig, rollout_config: Any) -> Optional[str]:
+    trace_config = _config_get(rollout_config, "trace")
+    trace_dir = _config_get(trace_config, "trace_dir")
+    if trace_dir:
+        return str(trace_dir)
+
+    if not _is_decoupled_spec_enabled(rollout_config):
+        return None
+    draft_config = config.get("draft", None)
+    if draft_config is None:
+        return None
+    output_dir = draft_config.get("output_dir", None)
+    return str(output_dir) if output_dir else None
 
 
 class AsyncLLMServerManager:
@@ -450,6 +481,7 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
         )
+        self.rollout_trace_dir = _get_rollout_trace_dir(config, self.rollout_config)
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -569,6 +601,19 @@ class AgentLoopWorker:
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        for key in ("index", "original_dataset_row_index", "original_dataset_file_index"):
+            if key in kwargs:
+                output.extra_fields[key] = kwargs[key]
+        if self.rollout_trace_dir:
+            prompt_text, response_text = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: (
+                    self.tokenizer.decode(output.prompt_ids, skip_special_tokens=True),
+                    self.tokenizer.decode(output.response_ids, skip_special_tokens=True),
+                ),
+            )
+            output.extra_fields["prompt_text"] = prompt_text
+            output.extra_fields["response_text"] = response_text
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -924,6 +969,9 @@ class AgentLoopManager:
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self.decoupled_spec_draft_replicas = []
+        self.rollout_trace_dir = _get_rollout_trace_dir(config, self.rollout_config)
+        self.trace_spec_metrics = _is_decoupled_spec_enabled(self.rollout_config)
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
@@ -955,12 +1003,39 @@ class AgentLoopManager:
             * self.rollout_config.data_parallel_size
             * self.rollout_config.pipeline_model_parallel_size
         )
-        world_size = (
-            self.worker_group.world_size
-            if self.worker_group
-            else self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
-        )
+        if self.worker_group:
+            world_size = self.worker_group.world_size
+        elif self.rollout_resource_pool:
+            world_size = self.rollout_resource_pool.world_size
+        else:
+            world_size = self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
         num_replicas = world_size // rollout_world_size
+
+        if self.rollout_config.get("enable_decoupled_spec", False):
+            from verl.experimental.decoupled_spec.initializer import initialize_decoupled_spec_rollout_servers
+
+            self.rollout_replicas, self.decoupled_spec_draft_replicas = (
+                await initialize_decoupled_spec_rollout_servers(
+                    config=self.config,
+                    rollout_config=self.rollout_config,
+                    model_config=self.model_config,
+                    rollout_replica_class=self.rollout_replica_class,
+                    num_replicas=num_replicas,
+                    worker_group=self.worker_group,
+                    rollout_resource_pool=self.rollout_resource_pool,
+                )
+            )
+            self.server_handles = [server._server_handle for server in self.rollout_replicas]
+            self.server_addresses = [server._server_address for server in self.rollout_replicas]
+            print(f"AgentLoopManager: {self.server_addresses}")
+
+            if self.rollout_config.prometheus.enable:
+                if self.rollout_config.disable_log_stats:
+                    raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+                update_prometheus_config(
+                    self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name
+                )
+            return
 
         self.rollout_replicas = [
             self.rollout_replica_class(
@@ -995,6 +1070,9 @@ class AgentLoopManager:
             if self.rollout_config.disable_log_stats:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
+
+    def _managed_all_rollout_replicas(self):
+        return [*self.rollout_replicas, *self.decoupled_spec_draft_replicas]
 
     async def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
@@ -1037,21 +1115,202 @@ class AgentLoopManager:
             DataProto: Output batch.
         """
 
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
-        outputs = await asyncio.gather(
-            *[
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
-            ]
-        )
-        output = DataProto.concat(outputs)
+        input_meta_info = getattr(prompts, "meta_info", {}) or {}
+        with timeline_span(
+            self.rollout_trace_dir,
+            "rollout",
+            global_step=input_meta_info.get("global_steps", None),
+            validate=bool(input_meta_info.get("validate", False)),
+            batch_size=len(prompts),
+            do_sample=input_meta_info.get("do_sample", True),
+        ):
+            chunkes = prompts.chunk(len(self.agent_loop_workers))
+            outputs = await asyncio.gather(
+                *[
+                    worker.generate_sequences.remote(chunk)
+                    for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+                ]
+            )
+            output = DataProto.concat(outputs)
 
-        # calculate performance metrics
-        metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
-        timing = self._performance_metrics(metrics, output)
+            # calculate performance metrics
+            metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
+            timing = self._performance_metrics(metrics, output)
 
-        output.meta_info = {"timing": timing, **outputs[0].meta_info}
+            output.meta_info = {"timing": timing, **outputs[0].meta_info}
+            if self.rollout_trace_dir:
+                self._dump_rollout_trace_outputs(output, input_meta_info)
         return output
+
+    def _dump_rollout_trace_outputs(self, output: DataProto, input_meta_info: dict[str, Any]) -> None:
+        base_output_dir = self.rollout_trace_dir
+        if not base_output_dir:
+            return
+
+        global_step = input_meta_info.get("global_steps", None)
+        step_dir = f"global_step_{global_step}" if global_step is not None else "global_step_unknown"
+        output_dir = os.path.join(base_output_dir, step_dir)
+        validate = bool(input_meta_info.get("validate", False))
+        if validate:
+            output_dir = os.path.join(output_dir, "validation")
+
+        os.makedirs(output_dir, exist_ok=True)
+        batch_id = f"{int(time.time_ns())}_{uuid4().hex[:8]}"
+
+        prompt_width = output.batch["prompts"].shape[1]
+        prompt_attention_mask = output.batch["attention_mask"][:, :prompt_width].bool()
+        response_attention_mask = output.batch["attention_mask"][:, prompt_width:].bool()
+        llm_response_mask = output.batch["response_mask"].bool()
+
+        def get_non_tensor(key: str, index: int, default=None):
+            values = output.non_tensor_batch.get(key)
+            if values is None or index >= len(values):
+                return default
+            return values[index]
+
+        csv_path = os.path.join(output_dir, "agent_loop_responses.csv")
+        jsonl_path = os.path.join(output_dir, "agent_loop_responses.jsonl")
+        csv_fields = [
+            "batch_id",
+            "row_index",
+            "global_step",
+            "validate",
+            "fully_async_sample_id",
+            "min_global_steps",
+            "max_global_steps",
+            "partial_rollout_span",
+            "original_dataset_row_index",
+            "prompt_length",
+            "response_length",
+            "e2e_latency",
+            "finish_reason",
+        ]
+        spec_csv_fields = [
+            "spec_accept_rate",
+            "spec_valid_accept_rate",
+            "spec_accept_length",
+            "spec_verify_ct",
+            "spec_valid_draft_token_num_by_position",
+            "spec_valid_accept_token_num_by_position",
+            "spec_valid_accept_rate_by_position",
+        ]
+        if self.trace_spec_metrics:
+            csv_fields += spec_csv_fields
+        write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+
+        with open(csv_path, "a", newline="", encoding="utf-8") as csv_file, open(
+            jsonl_path, "a", encoding="utf-8"
+        ) as jsonl_file:
+            writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
+            if write_header:
+                writer.writeheader()
+
+            for i in range(len(output)):
+                prompt_token_ids = output.batch["prompts"][i][prompt_attention_mask[i]].tolist()
+                response_token_ids = output.batch["responses"][i][response_attention_mask[i]].tolist()
+                sglang_meta_info = get_non_tensor("sglang_meta_info", i, {}) or {}
+                sglang_meta_info = self._to_jsonable(sglang_meta_info)
+                prompt = get_non_tensor("prompt_text", i, "") or ""
+                response = get_non_tensor("response_text", i, "") or ""
+                original_dataset_row_index = self._to_jsonable(
+                    get_non_tensor("original_dataset_row_index", i, None)
+                )
+                fully_async_sample_id = self._to_jsonable(
+                    get_non_tensor("fully_async_sample_id", i, input_meta_info.get("sample_id"))
+                )
+                min_global_steps = self._to_jsonable(get_non_tensor("min_global_steps", i, None))
+                max_global_steps = self._to_jsonable(get_non_tensor("max_global_steps", i, None))
+                try:
+                    partial_rollout_span = (
+                        None
+                        if min_global_steps is None or max_global_steps is None
+                        else int(max_global_steps) - int(min_global_steps)
+                    )
+                except (TypeError, ValueError):
+                    partial_rollout_span = None
+
+                record = {
+                    "batch_id": batch_id,
+                    "row_index": i,
+                    "global_step": global_step,
+                    "validate": validate,
+                    "sample_index": self._to_jsonable(get_non_tensor("index", i, None)),
+                    "original_dataset_row_index": original_dataset_row_index,
+                    "uid": self._to_jsonable(get_non_tensor("uid", i, None)),
+                    "fully_async_sample_id": fully_async_sample_id,
+                    "min_global_steps": min_global_steps,
+                    "max_global_steps": max_global_steps,
+                    "partial_rollout_span": partial_rollout_span,
+                    "prompt": prompt,
+                    "response": response,
+                    "raw_prompt": self._to_jsonable(get_non_tensor("raw_prompt", i, None)),
+                    "prompt_token_ids": prompt_token_ids,
+                    "response_token_ids": response_token_ids,
+                    "lengths": {
+                        "prompt": int(prompt_attention_mask[i].sum().item()),
+                        "response": int(response_attention_mask[i].sum().item()),
+                        "llm_response": int(llm_response_mask[i].sum().item()),
+                    },
+                    "sglang_meta_info": sglang_meta_info,
+                }
+                jsonl_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+                row = {
+                    "batch_id": batch_id,
+                    "row_index": i,
+                    "global_step": global_step,
+                    "validate": validate,
+                    "fully_async_sample_id": fully_async_sample_id,
+                    "min_global_steps": min_global_steps,
+                    "max_global_steps": max_global_steps,
+                    "partial_rollout_span": partial_rollout_span,
+                    "original_dataset_row_index": original_dataset_row_index,
+                    "prompt_length": record["lengths"]["prompt"],
+                    "response_length": record["lengths"]["response"],
+                    "e2e_latency": sglang_meta_info.get("e2e_latency"),
+                    "finish_reason": sglang_meta_info.get("finish_reason"),
+                }
+                if self.trace_spec_metrics:
+                    row.update(
+                        {
+                            "spec_accept_rate": sglang_meta_info.get("spec_accept_rate"),
+                            "spec_valid_accept_rate": sglang_meta_info.get("spec_valid_accept_rate"),
+                            "spec_accept_length": sglang_meta_info.get("spec_accept_length"),
+                            "spec_verify_ct": sglang_meta_info.get("spec_verify_ct"),
+                            "spec_valid_draft_token_num_by_position": self._csv_json_value(
+                                sglang_meta_info.get("spec_valid_draft_token_num_by_position")
+                            ),
+                            "spec_valid_accept_token_num_by_position": self._csv_json_value(
+                                sglang_meta_info.get("spec_valid_accept_token_num_by_position")
+                            ),
+                            "spec_valid_accept_rate_by_position": self._csv_json_value(
+                                sglang_meta_info.get("spec_valid_accept_rate_by_position")
+                            ),
+                        }
+                    )
+                writer.writerow(row)
+
+    @staticmethod
+    def _csv_json_value(value: Any) -> str:
+        if value is None:
+            return ""
+        return json.dumps(AgentLoopManager._to_jsonable(value), ensure_ascii=False)
+
+    @staticmethod
+    def _to_jsonable(value: Any) -> Any:
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        if isinstance(value, dict):
+            return {str(k): AgentLoopManager._to_jsonable(v) for k, v in value.items()}
+        if isinstance(value, tuple):
+            return [AgentLoopManager._to_jsonable(v) for v in value]
+        if isinstance(value, list):
+            return [AgentLoopManager._to_jsonable(v) for v in value]
+        return value
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}
@@ -1083,14 +1342,14 @@ class AgentLoopManager:
     @auto_await
     async def clear_kv_cache(self):
         """Clear all rollout kv cache, but don`t sleep."""
-        await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
+        await asyncio.gather(*[replica.clear_kv_cache() for replica in self._managed_all_rollout_replicas()])
 
     @auto_await
     async def start_profile(self, **kwargs):
         """Start profiling on all rollout replicas."""
-        await asyncio.gather(*[replica.start_profile(**kwargs) for replica in self.rollout_replicas])
+        await asyncio.gather(*[replica.start_profile(**kwargs) for replica in self._managed_all_rollout_replicas()])
 
     @auto_await
     async def stop_profile(self):
         """Stop profiling on all rollout replicas."""
-        await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
+        await asyncio.gather(*[replica.stop_profile() for replica in self._managed_all_rollout_replicas()])

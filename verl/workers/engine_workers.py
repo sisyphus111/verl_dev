@@ -35,7 +35,7 @@ from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
-from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
+from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_snapshot, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
@@ -624,19 +624,44 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         2. For async training with disaggregated trainer and rollout, send_weights only by checkpoint engine.
         """
 
+        log_gpu_memory_snapshot(
+            "training.update_weights.begin",
+            role="training",
+            backend=self.config.rollout.checkpoint_engine.backend,
+            global_steps=global_steps,
+        )
+
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if self.config.rollout.checkpoint_engine.backend != "naive":
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+            log_gpu_memory_snapshot(
+                "training.checkpoint_engine.send_weights.begin",
+                role="training",
+                backend=self.config.rollout.checkpoint_engine.backend,
+                global_steps=global_steps,
+            )
             await self.checkpoint_engine.send_weights(per_tensor_param)
+            log_gpu_memory_snapshot(
+                "training.checkpoint_engine.send_weights.end",
+                role="training",
+                backend=self.config.rollout.checkpoint_engine.backend,
+                global_steps=global_steps,
+            )
+            log_gpu_memory_snapshot(
+                "training.update_weights.end",
+                role="training",
+                backend=self.config.rollout.checkpoint_engine.backend,
+                global_steps=global_steps,
+            )
             return
 
         set_expandable_segments(False)
-        log_gpu_memory_usage("Before resume weights", logger=logger)
+        log_gpu_memory_usage("Before resume weights")
 
         # 1. resume weights and update weights
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
-        log_gpu_memory_usage("After resume weights", logger=logger)
+        log_gpu_memory_usage("After resume weights")
 
         # 2. get per tensor generator from engine, this will load model to gpu
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
@@ -664,7 +689,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             await self.rollout.update_weights(per_tensor_base_params, peft_config=peft_config, base_sync_done=False)
 
-        log_gpu_memory_usage("After update_weights", logger=logger)
+        log_gpu_memory_usage("After update_weights")
 
         # 3. offload model to cpu
         self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
@@ -673,10 +698,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
-        log_gpu_memory_usage("After resume kv_cache", logger=logger)
+        log_gpu_memory_usage("After resume kv_cache")
 
         self.base_sync_done = True
         set_expandable_segments(True)
+        log_gpu_memory_snapshot(
+            "training.update_weights.end",
+            role="training",
+            backend=self.config.rollout.checkpoint_engine.backend,
+            global_steps=global_steps,
+        )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

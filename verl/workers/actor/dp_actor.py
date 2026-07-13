@@ -465,7 +465,9 @@ class DataParallelPPOActor(BasePPOActor):
 
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+            micro_batches, batch_idx_list = prepare_dynamic_batch(
+                data, max_token_len=max_token_len, dp_group=torch.distributed.group.WORLD
+            )
         else:
             micro_batches = data.split(micro_batch_size)
 
@@ -543,9 +545,17 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
+        ppo_mini_batch_size = data.meta_info.get("ppo_mini_batch_size", self.config.ppo_mini_batch_size)
+        original_global_batch_info = dict(self.config.global_batch_info)
+        global_batch_info = data.meta_info.get("global_batch_info", None)
+        if global_batch_info is not None:
+            self.config.global_batch_info.clear()
+            self.config.global_batch_info.update(global_batch_info)
+        use_global_batch_info = global_batch_info is not None
+
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
+        mini_batches = data.split(ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
@@ -557,10 +567,12 @@ class DataParallelPPOActor(BasePPOActor):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    micro_batches, _ = prepare_dynamic_batch(
+                        mini_batch, max_token_len=max_token_len, dp_group=torch.distributed.group.WORLD
+                    )
                 else:
                     self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                        ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
@@ -580,9 +592,9 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
 
                     if self.config.use_dynamic_bsz:
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        loss_scale_factor = 1.0 if use_global_batch_info else response_mask.shape[0] / ppo_mini_batch_size
                     else:
-                        loss_scale_factor = 1 / self.gradient_accumulation
+                        loss_scale_factor = 1.0 if use_global_batch_info else 1 / self.gradient_accumulation
 
                     # all return: (bsz, response_length)
                     outputs = self._forward_micro_batch(
@@ -639,7 +651,12 @@ class DataParallelPPOActor(BasePPOActor):
 
                     policy_loss = pg_loss
                     if calculate_entropy and entropy is not None:
-                        entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        entropy_agg = agg_loss(
+                            loss_mat=entropy,
+                            loss_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            **self.config.global_batch_info,
+                        )
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
                         if entropy_coeff != 0:
                             policy_loss -= entropy_agg * entropy_coeff
@@ -650,7 +667,12 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        kl_loss = agg_loss(
+                            loss_mat=kld,
+                            loss_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            **self.config.global_batch_info,
+                        )
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
@@ -673,4 +695,7 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        if global_batch_info is not None:
+            self.config.global_batch_info.clear()
+            self.config.global_batch_info.update(original_global_batch_info)
         return metrics

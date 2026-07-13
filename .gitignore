@@ -130,3 +130,6 @@ logs
 log
 outputs
 .history
+
+# Local SpecRL experiments
+/examples/grpo_trainer/specrl/

@@ -1,0 +1,44 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+actor_rollout_ref:
+  rollout:
+    enable_decoupled_spec: true
+
+draft:
+  # Path to the drafter model.
+  model_path: null
+
+  # Path to the drafter tokenizer. Defaults to model_path when null.
+  tokenizer_path: null
+
+  # Drafter model load format.
+  load_format: auto
+
+  # Drafter precision/quantization policy. bfloat16 disables rollout quantization;
+  # fp8 enables SGLang FP8 quantization with bfloat16 compute dtype.
+  quantization: bfloat16
+
+  # Number of nodes used by drafter replicas.
+  nnodes: 1
+
+  # Total number of GPUs used by all drafter replicas.
+  ngpus: 8
+
+  # Tensor parallel size of each drafter replica.
+  tp_size: 2
+
+  # Number of speculative draft steps.
+  speculative_num_steps: 3
+
+  # Optional SGLang decoupled-spec CSV trace directory.
+  trace_dir: null
+
+  # Optional VERL AgentLoop base output directory for prompt/response and
+  # spec metrics. Each rollout step writes under global_step_<N>/.
+  output_dir: null

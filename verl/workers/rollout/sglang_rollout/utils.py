@@ -21,7 +21,16 @@ import torch
 import torch.distributed as dist
 
 from verl.utils.device import get_device_name
+from verl.utils.profiler import log_gpu_memory_snapshot
 from verl.workers.rollout.utils import ensure_async_iterator
+
+
+def _bytes_to_mib(num_bytes: int) -> str:
+    return f"{num_bytes / (1024**2):.2f}"
+
+
+def _tensor_shape(tensor: torch.Tensor) -> str:
+    return "x".join(str(dim) for dim in tensor.shape)
 
 
 def broadcast_pyobj(
@@ -94,16 +103,123 @@ async def get_named_tensor_buckets(
 
     current_bucket = []
     current_size = 0
-    async for name, tensor in ensure_async_iterator(iterable):
+    bucket_idx = 0
+    item_idx = 0
+    async_iter = ensure_async_iterator(iterable)
+    while True:
+        log_gpu_memory_snapshot(
+            "weight_sync.export_next.begin",
+            role="training",
+            bucket_idx=bucket_idx,
+            item_idx=item_idx,
+            current_bucket_mib=_bytes_to_mib(current_size),
+            bucket_limit_mib=_bytes_to_mib(bucket_bytes),
+        )
+
+        try:
+            name, tensor = await async_iter.__anext__()
+        except StopAsyncIteration:
+            break
+        except Exception as e:
+            log_gpu_memory_snapshot(
+                "weight_sync.export_next.exception",
+                role="training",
+                bucket_idx=bucket_idx,
+                item_idx=item_idx,
+                current_bucket_mib=_bytes_to_mib(current_size),
+                bucket_limit_mib=_bytes_to_mib(bucket_bytes),
+                exception=repr(e),
+            )
+            raise
+
         tensor_size = tensor.element_size() * tensor.numel()
+        log_gpu_memory_snapshot(
+            "weight_sync.export_next.end",
+            role="training",
+            bucket_idx=bucket_idx,
+            item_idx=item_idx,
+            name=name,
+            tensor_mib=_bytes_to_mib(tensor_size),
+            dtype=str(tensor.dtype).removeprefix("torch."),
+            device=str(tensor.device),
+            shape=_tensor_shape(tensor),
+            current_bucket_mib=_bytes_to_mib(current_size),
+        )
+
         if current_size + tensor_size > bucket_bytes:
             if current_bucket:
+                log_gpu_memory_snapshot(
+                    "weight_sync.bucket_yield.before",
+                    role="training",
+                    bucket_idx=bucket_idx,
+                    item_idx=item_idx,
+                    bucket_tensors=len(current_bucket),
+                    bucket_mib=_bytes_to_mib(current_size),
+                    next_name=name,
+                    next_tensor_mib=_bytes_to_mib(tensor_size),
+                )
                 yield current_bucket
+                log_gpu_memory_snapshot(
+                    "weight_sync.bucket_yield.after",
+                    role="training",
+                    bucket_idx=bucket_idx,
+                    item_idx=item_idx,
+                    bucket_tensors=len(current_bucket),
+                    bucket_mib=_bytes_to_mib(current_size),
+                )
+                bucket_idx += 1
+            log_gpu_memory_snapshot(
+                "weight_sync.bucket_clone.before",
+                role="training",
+                bucket_idx=bucket_idx,
+                item_idx=item_idx,
+                name=name,
+                tensor_mib=_bytes_to_mib(tensor_size),
+                current_bucket_mib="0.00",
+            )
             current_bucket = [(name, tensor.clone())]
             current_size = tensor_size
         else:
-            current_bucket.append((name, tensor.clone()))
+            log_gpu_memory_snapshot(
+                "weight_sync.bucket_clone.before",
+                role="training",
+                bucket_idx=bucket_idx,
+                item_idx=item_idx,
+                name=name,
+                tensor_mib=_bytes_to_mib(tensor_size),
+                current_bucket_mib=_bytes_to_mib(current_size),
+            )
+            cloned_tensor = tensor.clone()
+            current_bucket.append((name, cloned_tensor))
             current_size += tensor_size
+        log_gpu_memory_snapshot(
+            "weight_sync.bucket_clone.after",
+            role="training",
+            bucket_idx=bucket_idx,
+            item_idx=item_idx,
+            name=name,
+            tensor_mib=_bytes_to_mib(tensor_size),
+            current_bucket_mib=_bytes_to_mib(current_size),
+        )
+        item_idx += 1
 
     if current_bucket:
+        log_gpu_memory_snapshot(
+            "weight_sync.bucket_yield.before",
+            role="training",
+            bucket_idx=bucket_idx,
+            item_idx=item_idx,
+            bucket_tensors=len(current_bucket),
+            bucket_mib=_bytes_to_mib(current_size),
+            final=True,
+        )
         yield current_bucket
+        log_gpu_memory_snapshot(
+            "weight_sync.bucket_yield.after",
+            role="training",
+            bucket_idx=bucket_idx,
+            item_idx=item_idx,
+            bucket_tensors=len(current_bucket),
+            bucket_mib=_bytes_to_mib(current_size),
+            final=True,
+        )
